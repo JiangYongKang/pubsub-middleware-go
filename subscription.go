@@ -28,12 +28,17 @@ type queuedMessage struct {
 
 // subscription 是一个持久订阅的代理端状态：
 // 未发送队列 + 在途（已投递未确认）集合；断连后状态保留，重连后按序补投。
+//
+// 在途窗口（window）：代理对每个订阅最多同时保持 window 条未确认投递。
+// 这是单连接双向复用的关键流控——只要客户端每订阅本地缓冲 ≥ window，
+// 客户端接收泵就永远不会被慢订阅堵住，同一条连接上的发布回执始终能送达。
 type subscription struct {
 	id       string
 	clientID string
 	filter   string
 	capacity int
 	policy   OverflowPolicy
+	window   int // 在途（已投递未确认）上限
 
 	mu       sync.Mutex
 	online   bool
@@ -46,13 +51,17 @@ type subscription struct {
 	closed   bool
 }
 
-func newSubscription(id, clientID, filter string, capacity int, policy OverflowPolicy) *subscription {
+func newSubscription(id, clientID, filter string, capacity int, policy OverflowPolicy, window int) *subscription {
+	if window <= 0 {
+		window = 1
+	}
 	return &subscription{
 		id:       id,
 		clientID: clientID,
 		filter:   filter,
 		capacity: capacity,
 		policy:   policy,
+		window:   window,
 		inflight: map[uint64]*queuedMessage{},
 		attempts: map[uint64]uint16{},
 		notify:   make(chan struct{}, 1),
@@ -142,14 +151,31 @@ func (s *subscription) enqueue(messageID, topic string, payload []byte) Delivery
 	return out
 }
 
-// head 在不改变队列的前提下查看队首消息（在线、非空时）。
+// head 在不改变队列的前提下查看队首消息（在线、非空、在途未超窗口时）。
 func (s *subscription) head() *queuedMessage {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.online || s.closed || len(s.queue) == 0 {
 		return nil
 	}
+	if len(s.inflight) >= s.window {
+		return nil // 在途窗口已满：等 ACK 释放额度后再投递
+	}
 	return s.queue[0]
+}
+
+// windowFull 报告在途是否已达窗口上限（供投递循环打日志区分"空"与"等 ACK"）。
+func (s *subscription) windowFull() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.online && !s.closed && len(s.queue) > 0 && len(s.inflight) >= s.window
+}
+
+// inflightLen 返回当前在途条数（供日志/测试观察）。
+func (s *subscription) inflightLen() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.inflight)
 }
 
 // previewNextAttempt 给出 msg 若此刻转入在途，将使用的尝试次数（不改变状态）。
@@ -175,11 +201,13 @@ func (s *subscription) markInflight(msg *queuedMessage) uint16 {
 
 // ack 确认一条消息，从在途集合移除并清理尝试计数。
 // 对已被丢弃/已确认/未知序号的确认一律幂等忽略。
+// 确认会释放在途窗口额度，因此唤醒投递循环继续发送。
 func (s *subscription) ack(seq uint64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.inflight, seq)
 	delete(s.attempts, seq)
+	s.mu.Unlock()
+	s.signal()
 }
 
 // goOffline 在 conn 仍是该订阅的附着连接时令其离线：

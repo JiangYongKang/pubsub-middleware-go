@@ -325,14 +325,45 @@ func (c *Client) runSendLoop(ctx context.Context) {
 		case <-c.closeCh:
 			return
 		case f := <-c.ackCh:
-			conn := c.getConn()
-			if conn == nil {
-				continue
-			}
-			if err := c.writeOn(conn, f); err != nil {
+			// ACK 必须可靠到达：在途窗口靠 ACK 释放额度，丢失的 ACK 会让
+			// 投递循环永久停摆。瞬时背压（对端缓冲满）按退避重试；
+			// 连接断开才放弃——重连后代理补投，消费端去重保证安全。
+			if err := c.writeWithRetry(ctx, f); err != nil {
 				c.log("ack send failed sub=%s msg=%s: %v (redelivery expected, dedup will make it safe)",
 					f.SubscriptionID, f.MessageID, err)
 			}
+		}
+	}
+}
+
+// writeWithRetry 发送一帧；对端接收缓冲暂时满（瞬时背压）时按退避重试——
+// 本地传输的 Send 是非阻塞的，失败即"未写入"，重试不会产生重复帧。
+// 连接断开、客户端关闭或 ctx 取消时返回错误。
+func (c *Client) writeWithRetry(ctx context.Context, f *Frame) error {
+	backoff := 2 * time.Millisecond
+	for {
+		conn := c.getConn()
+		if conn == nil {
+			return errors.New("client not connected")
+		}
+		err := c.writeOn(conn, f)
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-conn.Done():
+			return err // 连接已断：由重连补投 / 调用方重试兜底
+		default:
+		}
+		select {
+		case <-c.closeCh:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 32*time.Millisecond {
+			backoff *= 2
 		}
 	}
 }
@@ -534,12 +565,22 @@ func (c *Client) Subscribe(ctx context.Context, durableID, filter string, h Hand
 // Publish 发布一条消息，并等待代理回送带每个订阅失败/降级原因的回执。
 // 发布本身不被慢消费者阻塞：积压处置在代理侧立即完成，结论随回执返回。
 func (c *Client) Publish(ctx context.Context, topic string, payload []byte) (*PublishReceipt, error) {
+	return c.PublishExt(ctx, topic, payload, nil)
+}
+
+// PublishExt 同 Publish，但允许在帧上附带扩展字段（TLV 扩展区）。
+// 用于灰度混跑：新版本客户端发布携带新字段的帧，只认识早期字段的对端
+// 会安全忽略这些字段并正常处理（见 Decode 的 unknown_field_ignored 结论）。
+func (c *Client) PublishExt(ctx context.Context, topic string, payload []byte, exts map[string][]byte) (*PublishReceipt, error) {
 	conn := c.getConn()
 	if conn == nil {
 		return nil, errors.New("client not connected")
 	}
 	id := newMessageID()
 	f := Frame{Type: FramePublish, MessageID: id, Topic: topic, Payload: payload}
+	for k, v := range exts {
+		f.SetExt(k, v)
+	}
 
 	ch := make(chan *Frame, 1)
 	c.mu.Lock()
@@ -551,7 +592,9 @@ func (c *Client) Publish(ctx context.Context, topic string, payload []byte) (*Pu
 		c.mu.Unlock()
 	}()
 
-	if err := c.writeOn(conn, &f); err != nil {
+	// 瞬时背压（对端缓冲被 ACK 等控制帧短暂占用）自动重试；
+	// 只有连接真正断开或 ctx 取消才返回错误。
+	if err := c.writeWithRetry(ctx, &f); err != nil {
 		return nil, err
 	}
 	c.log("PUBLISH msg=%s topic=%s", id, topic)

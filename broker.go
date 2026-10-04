@@ -31,13 +31,18 @@ func (r *connRef) store(c Conn) {
 // 关键不变量：
 //   - 订阅以 durableID 标识，连接断开只令其离线，状态（队列 + 在途）保留；
 //   - 每个订阅的投递循环独立运行，慢消费者只拖慢它自己，不影响发布方与其他订阅；
-//   - 同一订阅内消息严格按 seq 升序投递，重连补投也不例外。
+//   - 同一订阅内消息严格按 seq 升序投递，重连补投也不例外；
+//   - 每个订阅的在途投递不超过 window 条：慢订阅的在途额度耗尽后代理停止下发，
+//     客户端接收泵因此永远只需容纳 window 条投递，不会被堵死——
+//     同一条连接上的发布回执（PublishAck）始终能送达（单连接双向复用的前提）。
 type Broker struct {
 	mu        sync.Mutex
 	subs      map[string]*subscription
 	transport Transport
 	capacity  int
 	policy    OverflowPolicy
+	window    int
+	delivExts map[string][]byte // 附加到每个 Deliver 帧的扩展字段（模拟新版本代理灰度）
 	logf      func(format string, args ...any)
 	closed    bool
 	closeCh   chan struct{}
@@ -64,6 +69,27 @@ func WithBrokerOverflowPolicy(p OverflowPolicy) BrokerOption {
 	return func(b *Broker) { b.policy = p }
 }
 
+// WithBrokerMaxInFlight 设置每个订阅的在途投递窗口（默认 8）。
+// 客户端每个订阅的本地投递缓冲（WithClientDeliverBuffer，默认 128）应不小于该值：
+// 这样慢订阅只会耗尽自己的在途额度，代理停止下发，而不会堵住客户端接收泵，
+// 同一连接上的发布与回执因此不受影响。
+func WithBrokerMaxInFlight(n int) BrokerOption {
+	return func(b *Broker) {
+		if n > 0 {
+			b.window = n
+		}
+	}
+}
+
+// WithBrokerDeliverExtensions 让每个 Deliver 帧附带给定扩展字段，
+// 用于灰度混跑验证：模拟"认识新字段的新版本代理"向"只认识早期字段的客户端"
+// 下发携带未知 TLV 的帧，对端应安全忽略并正常消费。
+func WithBrokerDeliverExtensions(exts map[string][]byte) BrokerOption {
+	return func(b *Broker) {
+		b.delivExts = exts
+	}
+}
+
 // WithBrokerLogger 注入日志函数（测试中打印投递流水与判定依据）。
 func WithBrokerLogger(f func(format string, args ...any)) BrokerOption {
 	return func(b *Broker) { b.logf = f }
@@ -76,6 +102,7 @@ func NewBroker(t Transport, opts ...BrokerOption) *Broker {
 		transport: t,
 		capacity:  64,
 		policy:    OverflowRejectNewest,
+		window:    8,
 		logf:      func(string, ...any) {},
 		closeCh:   make(chan struct{}),
 		conns:     map[string]*connRef{},
@@ -215,8 +242,8 @@ func (b *Broker) handleSubscribe(conn Conn, clientID string, f *Frame, attached 
 	if !created {
 		b.log("client=%s subscription=%s RESUMED filter=%q backlog=%d", clientID, s.id, f.Filter, s.backlog())
 	} else {
-		b.log("client=%s subscription=%s CREATED filter=%q capacity=%d policy=%d",
-			clientID, s.id, f.Filter, s.capacity, s.policy)
+		b.log("client=%s subscription=%s CREATED filter=%q capacity=%d policy=%d window=%d",
+			clientID, s.id, f.Filter, s.capacity, s.policy, s.window)
 		b.wg.Add(1)
 		go func(s *subscription) {
 			defer b.wg.Done()
@@ -234,7 +261,7 @@ func (b *Broker) getOrCreateSubscription(id, clientID, filter string) (*subscrip
 	if s, ok := b.subs[id]; ok {
 		return s, false
 	}
-	s := newSubscription(id, clientID, filter, b.capacity, b.policy)
+	s := newSubscription(id, clientID, filter, b.capacity, b.policy, b.window)
 	b.subs[id] = s
 	return s, true
 }
@@ -329,6 +356,13 @@ func (b *Broker) deliverLoop(s *subscription) {
 			}
 			msg := s.head()
 			if msg == nil {
+				if s.windowFull() {
+					// 在途窗口满：暂停下发，等 ACK 释放额度（ack 会唤醒本循环）。
+					// 慢订阅因此停在"在途 window 条 + 队列积压"，客户端接收泵不被堵死，
+					// 同连接上的 PublishAck 与其他订阅的投递照常通行。
+					b.log("subscription=%s WINDOW-FULL inflight=%d window=%d backlog=%d (delivery paused until ACK)",
+						s.id, s.inflightLen(), s.window, s.backlog())
+				}
 				break
 			}
 			// attempt 取下一条在途将记录的次数（markInflight 会 +1）；
@@ -343,6 +377,9 @@ func (b *Broker) deliverLoop(s *subscription) {
 				Attempt:        nextAttempt,
 			}
 			df.PutSeq(msg.seq)
+			for k, v := range b.delivExts {
+				df.SetExt(k, v)
+			}
 			// 先尝试非阻塞发送：只有真正写进对端连接，才把消息移出队列转入在途。
 			raw, err := df.Encode()
 			if err != nil {
@@ -479,16 +516,41 @@ func (b *Broker) handlePublish(conn Conn, clientID string, f *Frame) {
 	}
 }
 
-// sendFrame 非阻塞语义的发送：单次帧写入失败即返回，绝不阻塞发布路径。
+// sendFrame 发送一帧控制帧（PublishAck/Subscribed）。
+// 本地传输的 Send 是非阻塞的：对端接收缓冲被投递帧短暂占满时会瞬时失败，
+// 这里按退避重试（控制帧必须送达，丢失回执会让发布方空等）；
+// 连接断开或代理关闭时立即返回错误。在客户端接收泵不被堵死
+// （每订阅本地缓冲 ≥ 在途窗口）的前提下，重试总是毫秒级完成。
 func (b *Broker) sendFrame(conn Conn, clientID string, f *Frame) error {
 	raw, err := f.Encode()
 	if err != nil {
 		return err
 	}
-	if err := conn.Send(raw); err != nil {
-		return err
+	backoff := 2 * time.Millisecond
+	retried := false
+	for {
+		err := conn.Send(raw)
+		if err == nil {
+			return nil
+		}
+		if !isPeerBufferFull(err) {
+			return err // 连接断开等硬错误：不重试
+		}
+		if !retried {
+			retried = true
+			b.log("control frame type=%d to=%s: peer buffer busy, retrying (transient backpressure)", f.Type, clientID)
+		}
+		select {
+		case <-conn.Done():
+			return err
+		case <-b.closeCh:
+			return err
+		case <-time.After(backoff):
+		}
+		if backoff < 32*time.Millisecond {
+			backoff *= 2
+		}
 	}
-	return nil
 }
 
 // Close 停止代理并关闭全部在途连接（持久订阅状态随对象释放）。

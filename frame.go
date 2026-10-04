@@ -73,6 +73,17 @@ const (
 	DecodeReject                        // 必须拒绝
 )
 
+func (d DecodeDecision) String() string {
+	switch d {
+	case DecodeProcess:
+		return "process"
+	case DecodeReject:
+		return "reject"
+	default:
+		return "unknown"
+	}
+}
+
 // DecodeResult 给出确定且可区分的解码结论。
 type DecodeResult struct {
 	Frame         Frame
@@ -121,14 +132,30 @@ func readU16String(data []byte, pos int) (string, int, bool) {
 	return string(data[pos : pos+n]), pos + n, true
 }
 
-// Encode 按当前协议版本序列化一帧（空字段省略为零长度）。
+// Encode 按帧自带版本（缺省为当前版本）序列化（空字段省略为零长度）。
 func (f Frame) Encode() ([]byte, error) {
-	b := make([]byte, 0, frameHeaderL+128)
-	b = append(b, frameMagic0, frameMagic1)
 	version := f.Version
 	if version == 0 {
 		version = FrameCurrentVersion
 	}
+	return f.EncodeAs(version)
+}
+
+// EncodeAs 按指定协议版本序列化一帧。
+// v1 布局在 payload 后直接以 checksum 结尾，没有 outcomes/extensions 区；
+// 因此把携带 outcomes/extensions 的帧编码为 v1 属于（会丢数据）是明确错误。
+// 该入口用于兼容自检：自行生成一批早期格式的帧，再用当前解码器读回验证。
+func (f Frame) EncodeAs(version uint8) ([]byte, error) {
+	if version < FrameMinSupportedVersion || version > FrameCurrentVersion {
+		return nil, &Error{Op: "frame.encode", Reason: ReasonUnsupportedVersion,
+			Err: fmt.Errorf("version %d outside [%d,%d]", version, FrameMinSupportedVersion, FrameCurrentVersion)}
+	}
+	if version == FrameV1 && (len(f.Outcomes) > 0 || len(f.Extensions) > 0) {
+		return nil, &Error{Op: "frame.encode", Reason: ReasonUnsupportedVersion,
+			Err: fmt.Errorf("v1 layout cannot carry outcomes/extensions")}
+	}
+	b := make([]byte, 0, frameHeaderL+128)
+	b = append(b, frameMagic0, frameMagic1)
 	b = append(b, version, byte(f.Type), f.Flags)
 	var a [2]byte
 	binary.BigEndian.PutUint16(a[:], f.Attempt)
@@ -144,34 +171,36 @@ func (f Frame) Encode() ([]byte, error) {
 	b = append(b, l4[:]...)
 	b = append(b, f.Payload...)
 
-	binary.BigEndian.PutUint16(a[:], uint16(len(f.Outcomes)))
-	b = append(b, a[:]...)
-	for _, o := range f.Outcomes {
-		b = appendU16String(b, o.SubscriptionID)
-		b = append(b, byte(o.State))
-		b = appendU16String(b, string(o.Reason))
-	}
-
-	// 扩展区：以 TLV 形式写入应用扩展 / 新版本字段。
-	// 旧版本解码器对不认识的 tag 会安全跳过，因此这里新增字段不破坏历史可读性。
-	extKeys := make([]string, 0, len(f.Extensions))
-	for k := range f.Extensions {
-		extKeys = append(extKeys, k)
-	}
-	sort.Strings(extKeys)
-	binary.BigEndian.PutUint16(a[:], uint16(len(extKeys)))
-	b = append(b, a[:]...)
-	for _, k := range extKeys {
-		tag, err := strconv.ParseUint(k, 16, 16)
-		if err != nil {
-			return nil, &Error{Op: "frame.encode", Reason: ReasonIncompleteField, Err: err}
+	if version >= FrameV2 {
+		binary.BigEndian.PutUint16(a[:], uint16(len(f.Outcomes)))
+		b = append(b, a[:]...)
+		for _, o := range f.Outcomes {
+			b = appendU16String(b, o.SubscriptionID)
+			b = append(b, byte(o.State))
+			b = appendU16String(b, string(o.Reason))
 		}
-		v := f.Extensions[k]
-		binary.BigEndian.PutUint16(a[:], uint16(tag))
+
+		// 扩展区：以 TLV 形式写入应用扩展 / 新版本字段。
+		// 旧版本解码器对不认识的 tag 会安全跳过，因此这里新增字段不破坏历史可读性。
+		extKeys := make([]string, 0, len(f.Extensions))
+		for k := range f.Extensions {
+			extKeys = append(extKeys, k)
+		}
+		sort.Strings(extKeys)
+		binary.BigEndian.PutUint16(a[:], uint16(len(extKeys)))
 		b = append(b, a[:]...)
-		binary.BigEndian.PutUint16(a[:], uint16(len(v)))
-		b = append(b, a[:]...)
-		b = append(b, v...)
+		for _, k := range extKeys {
+			tag, err := strconv.ParseUint(k, 16, 16)
+			if err != nil {
+				return nil, &Error{Op: "frame.encode", Reason: ReasonIncompleteField, Err: err}
+			}
+			v := f.Extensions[k]
+			binary.BigEndian.PutUint16(a[:], uint16(tag))
+			b = append(b, a[:]...)
+			binary.BigEndian.PutUint16(a[:], uint16(len(v)))
+			b = append(b, a[:]...)
+			b = append(b, v...)
+		}
 	}
 
 	sum := crc32.Checksum(b, crcTable)
@@ -321,6 +350,60 @@ func Decode(data []byte) (DecodeResult, error) {
 
 func unknownFieldKey(tag uint16) string {
 	return fmt.Sprintf("%04x", tag)
+}
+
+// CheckLegacyCompat 兼容自检：把 frames 逐一按 version（早期格式）编码，
+// 再用当前版本解码器读回，要求内容与顺序原样还原。
+// 任何一帧编码失败、解码拒绝或字段对不上，都返回带序号的错误。
+// 用于灰度混跑前的本地验证：证明"早期格式写出的历史消息，当前版本仍可读"。
+func CheckLegacyCompat(frames []Frame, version uint8) error {
+	for i, f := range frames {
+		raw, err := f.EncodeAs(version)
+		if err != nil {
+			return fmt.Errorf("legacy compat check: frame %d encode as v%d: %w", i, version, err)
+		}
+		res, err := Decode(raw)
+		if err != nil {
+			return fmt.Errorf("legacy compat check: frame %d decode: %w", i, err)
+		}
+		if res.Decision != DecodeProcess {
+			return fmt.Errorf("legacy compat check: frame %d decision=%v reason=%s", i, res.Decision, res.Reason)
+		}
+		if !frameSemanticEqual(f, res.Frame) {
+			return fmt.Errorf("legacy compat check: frame %d content mismatch: wrote %+v read %+v", i, f, res.Frame)
+		}
+	}
+	return nil
+}
+
+// frameSemanticEqual 比较帧的业务字段（版本号本身不参与：读回帧的版本即编码版本）。
+func frameSemanticEqual(a, b Frame) bool {
+	if a.Type != b.Type || a.Flags != b.Flags || a.Attempt != b.Attempt ||
+		a.SubscriptionID != b.SubscriptionID || a.MessageID != b.MessageID ||
+		a.Filter != b.Filter || a.Topic != b.Topic {
+		return false
+	}
+	if string(a.Payload) != string(b.Payload) {
+		return false
+	}
+	if len(a.Outcomes) != len(b.Outcomes) {
+		return false
+	}
+	for i := range a.Outcomes {
+		if a.Outcomes[i] != b.Outcomes[i] {
+			return false
+		}
+	}
+	if len(a.Extensions) != len(b.Extensions) {
+		return false
+	}
+	for k, v := range a.Extensions {
+		bv, ok := b.Extensions[k]
+		if !ok || string(v) != string(bv) {
+			return false
+		}
+	}
+	return true
 }
 
 // 应用层（代理/客户端之间）在 Extensions 中约定的键名。

@@ -28,7 +28,7 @@ func TestMatchTopic(t *testing.T) {
 
 // RejectNewest：积压达到容量后新消息失败，原因可区分，且消息不入队、顺序不乱。
 func TestOverflowRejectNewest(t *testing.T) {
-	s := newSubscription("s1", "c1", "t", 3, OverflowRejectNewest)
+	s := newSubscription("s1", "c1", "t", 3, OverflowRejectNewest, 64)
 	s.attach(&recordingConn{})
 	var rejected []string
 	for i := 0; i < 5; i++ {
@@ -60,7 +60,7 @@ func TestOverflowRejectNewest(t *testing.T) {
 
 // DropOldest：积压达到容量后丢弃最旧未发送消息，新消息入队，降级原因可区分。
 func TestOverflowDropOldest(t *testing.T) {
-	s := newSubscription("s1", "c1", "t", 3, OverflowDropOldest)
+	s := newSubscription("s1", "c1", "t", 3, OverflowDropOldest, 64)
 	s.attach(&recordingConn{})
 	var degraded []string
 	for i := 0; i < 5; i++ {
@@ -92,7 +92,7 @@ func TestOverflowDropOldest(t *testing.T) {
 // 断连后在途消息按原顺序归还队首：先投递 m1,m2（未确认），m3 在队列中，
 // 断连后恢复，补投顺序必须仍是 m1,m2,m3。
 func TestOfflineInflightReturnedInOrder(t *testing.T) {
-	s := newSubscription("s1", "c1", "t", 10, OverflowRejectNewest)
+	s := newSubscription("s1", "c1", "t", 10, OverflowRejectNewest, 64)
 	for i := 0; i < 3; i++ {
 		if o := s.enqueue(msgID(i), "t", nil); o.State != DeliveryStateQueued {
 			t.Fatalf("enqueue %d: %+v", i, o)
@@ -137,7 +137,7 @@ func TestOfflineInflightReturnedInOrder(t *testing.T) {
 
 // ACK 幂等：重复/未知确认不产生错误状态。
 func TestAckIdempotent(t *testing.T) {
-	s := newSubscription("s1", "c1", "t", 3, OverflowRejectNewest)
+	s := newSubscription("s1", "c1", "t", 3, OverflowRejectNewest, 64)
 	s.attach(&recordingConn{})
 	o := s.enqueue("m", "t", nil)
 	if o.State != DeliveryStateQueued {

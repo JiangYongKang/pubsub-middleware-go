@@ -30,6 +30,15 @@ type Transport interface {
 // 慢消费者背压——真正的容量上限由代理侧每订阅积压队列（capacity）决定。
 const localConnBuffer = 1
 
+// localConnState 是一条逻辑链路的共享状态：任一端 Close 都会关闭 done，
+// 另一端随后的 Send/Recv 立即得到 ReasonTransportClosed（与真实连接一致）。
+type localConnState struct {
+	done chan struct{}
+	once sync.Once
+}
+
+func (s *localConnState) close() { s.once.Do(func() { close(s.done) }) }
+
 // localConn 是 LocalTransport 上的一端。
 // Send 写入本端 out，对端从其 in 读出，两条有向通道共同组成一条逻辑链路。
 type localConn struct {
@@ -38,7 +47,7 @@ type localConn struct {
 	out    chan []byte // 本端 Send 写入、对端 Recv 读出
 	mu     sync.Mutex
 	closed bool
-	done   chan struct{}
+	state  *localConnState
 }
 
 func (c *localConn) Send(frame []byte) error {
@@ -54,7 +63,7 @@ func (c *localConn) Send(frame []byte) error {
 	select {
 	case c.out <- cp:
 		return nil
-	case <-c.done:
+	case <-c.state.done:
 		return &Error{Op: "conn.send", Reason: ReasonTransportClosed, Err: errors.New("connection closed")}
 	default:
 		return &Error{Op: "conn.send", Reason: ReasonBacklogFullRejectNewest,
@@ -69,7 +78,7 @@ func (c *localConn) Recv() ([]byte, error) {
 			return nil, &Error{Op: "conn.recv", Reason: ReasonTransportClosed, Err: errors.New("connection closed")}
 		}
 		return b, nil
-	case <-c.done:
+	case <-c.state.done:
 		return nil, &Error{Op: "conn.recv", Reason: ReasonTransportClosed, Err: errors.New("connection closed")}
 	}
 }
@@ -78,13 +87,13 @@ func (c *localConn) Close() error {
 	c.mu.Lock()
 	if !c.closed {
 		c.closed = true
-		close(c.done)
+		c.state.close()
 	}
 	c.mu.Unlock()
 	return nil
 }
 
-func (c *localConn) Done() <-chan struct{} { return c.done }
+func (c *localConn) Done() <-chan struct{} { return c.state.done }
 
 func (c *localConn) ClientID() string { return c.id }
 
@@ -128,9 +137,11 @@ func (t *LocalTransport) Dial(clientID string) (Conn, error) {
 
 	clientToBroker := make(chan []byte, localConnBuffer)
 	brokerToClient := make(chan []byte, localConnBuffer)
+	// 两端共享一个链路状态：任一端关闭，另一端立即可感知。
+	state := &localConnState{done: make(chan struct{})}
 	// 客户端端 out = clientToBroker，其 in = brokerToClient；代理端反之。
-	clientSide := &localConn{id: clientID, in: brokerToClient, out: clientToBroker, done: make(chan struct{})}
-	brokerSide := &localConn{id: clientID, in: clientToBroker, out: brokerToClient, done: make(chan struct{})}
+	clientSide := &localConn{id: clientID, in: brokerToClient, out: clientToBroker, state: state}
+	brokerSide := &localConn{id: clientID, in: clientToBroker, out: brokerToClient, state: state}
 
 	// 断网时同时掐断两端：模拟"客户端与代理之间链路中断"，
 	// 任一端随后的 Send/Recv 立即得到 ReasonTransportClosed。

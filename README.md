@@ -86,6 +86,24 @@ broker := pubsub.NewBroker(tr,
 
 其他常见结论：无匹配订阅为 `NoSubscriber`；订阅已关闭为 `Closed`。
 
+### 在途窗口与单连接双向复用
+
+代理对每个订阅限制**在途投递窗口**（已投递未确认条数，默认 8，
+`WithBrokerMaxInFlight` 可调）。窗口耗尽后代理暂停下发（日志 `WINDOW-FULL`），
+ACK 释放额度后自动继续。由此得到一条关键不变量：
+
+> 客户端每个订阅的本地投递缓冲（`WithClientDeliverBuffer`，默认 128）不小于
+> 在途窗口时，慢订阅只会耗尽自己的在途额度，**客户端接收泵永不被堵死**。
+
+这使得**单个客户端可以在一条连接上同时收发**：一路订阅消费很慢、积压触顶时，
+同连接上的 `Publish` 照样快速返回并拿到明确回执（`queued` / `rejected` /
+`degraded` / `no_subscriber`），同一客户端的其他订阅和其他客户端都不受影响
+（`TestE2ESingleConnectionDuplexSlowSubAndPublishing` 连续两轮验证结论逐位一致）。
+
+配套机制：客户端 ACK 与发布帧、代理控制帧（PublishAck/Subscribed）在遭遇
+**瞬时**对端缓冲满时按退避自动重试（本地传输 Send 为非阻塞，失败即未写入，
+重试安全）；只有连接真正断开才放弃，断开后由重连补投与消费端去重兜底。
+
 ## 三、消息格式与版本兼容
 
 帧为自定义二进制格式：`魔数 | 版本 | 类型 | 标志 | 尝试次数 | 长度前缀字段 |
@@ -117,19 +135,50 @@ broker := pubsub.NewBroker(tr,
 - 代理/客户端收到损坏或不兼容帧时记录判定依据并关闭该连接，绝不把半损坏数据
   误判为正常消息；收到带未知字段的合法帧则继续处理。
 
-## 四、可解释性与判定依据
+### 新旧版本灰度混跑
+
+- `Frame.EncodeAs(version)` 可按指定版本编码（v1 布局没有 outcomes/扩展区，
+  携带这些字段编码为 v1 会明确报错而不是静默丢数据）。
+- `CheckLegacyCompat(frames, version)` 是**兼容自检**入口：把一批帧按早期格式
+  编码、再用当前解码器读回，要求内容与顺序原样还原，任何一帧对不上都报错。
+- 灰度注入点：`Client.PublishExt` 让发布帧附带新扩展字段（模拟新版本客户端）；
+  `WithBrokerDeliverExtensions` 让代理下发的投递帧附带新扩展字段
+  （模拟新版本代理）。只认识早期字段的一侧会安全忽略这些字段并继续正常收发，
+  日志留下 `PROCESS with ignored future fields` 判定依据，不会断连。
+- 真正损坏的帧（校验和错、截断、版本越界）仍然 `Reject` 并断开连接，
+  与"可安全忽略"在日志与回执中严格区分
+  （`TestE2EGrayMixedVersionsInterop` 端到端覆盖）。
+
+## 四、混合负载下的容量规则
+
+把单连接双向复用与新旧版本穿插叠加（同一连接慢订阅积压 + 持续发布 +
+未来字段扩展帧 + v1 历史帧注入）时，容量规则保持不变且**确定**：
+
+- 积压判定只数**该订阅自己的队列**（在途窗口内的消息不占队列容量）；
+- 触顶结论由订阅的 `OverflowPolicy` 唯一决定：`RejectNewest` 永远拒绝最新、
+  `DropOldest` 永远丢弃最旧的未发送消息，**同一负载重复执行结论逐位一致**
+  （不会这次丢最旧、下次丢最新）；
+- 被处置的消息只影响它所属订阅：其他订阅照常入队，发布侧回执照常返回，
+  心跳等无订阅者的发布照常拿到 `no_subscriber` 结论
+  （`TestE2EMixedLoadCapacityDeterminism` 对两种策略各跑两遍验证）。
+
+## 五、可解释性与判定依据
 
 - 所有关键动作都有结构化日志（可注入 `WithBrokerLogger` / `WithClientLogger`）：
   `CREATED/RESUMED/OFFLINE/QUEUED/DELIVER/ACK/DUP-DROP/REJECT/DEGRADED/PEER-BUFFER-FULL` 等。
 - 失败与降级原因都以 `Reason` 字符串贯穿：传输错误、积压处置、帧解码拒绝。
 - 单测日志会实时打印**投递流水**与每一步**判定依据**（见测试输出）。
 
-## 五、验证方法
+## 六、验证方法
 
 ```bash
 go test ./...              # 全部单元测试与端到端场景
 go test -race ./...        # 竞态检测
 go test -v -run TestE2E    # 观察端到端投递流水与判定依据
+go test -v -run TestE2ESingleConnectionDuplex   # 单连接双向复用
+go test -v -run TestE2EGrayMixedVersions        # 新旧版本灰度混跑
+go test -v -run TestE2EMixedLoadCapacity        # 混合负载容量取舍（两种策略各两遍）
+go test -v -run 'TestLegacyBatch|TestMixedBatch' # 帧级兼容自检与混合批次判定
 ```
 
 测试覆盖：
@@ -139,6 +188,9 @@ go test -v -run TestE2E    # 观察端到端投递流水与判定依据
 | `TestFrameDecodeRejectReasons` | 6 类必须拒绝的损坏/不兼容帧，原因逐一可区分 |
 | `TestFrameDecodeUnknownFieldsSafelyIgnored` | 未知 TLV 字段被安全忽略且已知字段完好 |
 | `TestFrameDecodeOlderShapeReadable` | v1 历史消息在新版本下仍可读 |
+| `TestLegacyBatchRoundTripSelfCheck` | 自生成一批 v1 帧、当前版本读回，内容顺序原样还原 |
+| `TestEncodeAsV1RejectsUnrepresentableFields` | v1 装不下的字段编码时明确报错 |
+| `TestMixedBatchDecodeDecisions` | v1/新字段/保留字段/损坏帧混合批次，三类判定可区分 |
 | `TestMatchTopic` | 主题过滤 `*` / `>` 规则 |
 | `TestOverflowRejectNewest` / `TestOverflowDropOldest` | 两种背压策略、失败与降级原因可区分、顺序确定 |
 | `TestOfflineInflightReturnedInOrder` | 在途消息断连后按原顺序归还、重连保序补投 |
@@ -146,6 +198,9 @@ go test -v -run TestE2E    # 观察端到端投递流水与判定依据
 | `TestE2EDuplicateIdentifiedAndDropped` | ACK 丢失后重投被识别并安全丢弃，业务只执行一次 |
 | `TestE2ESlowConsumerBackpressureIsolation` | 慢订阅不阻塞发布、不影响快订阅；拒绝原因可区分 |
 | `TestE2EDropOldestDegradationReason` | 离线积压降级丢最旧，重连只收到保留的最新消息 |
+| `TestE2ESingleConnectionDuplexSlowSubAndPublishing` | 单连接同时收发：慢订阅积压时发布快速返回、结论明确、两轮一致 |
+| `TestE2EGrayMixedVersionsInterop` | 新旧版本灰度混跑：未知字段安全忽略、v1 帧可读、损坏帧拒绝 |
+| `TestE2EMixedLoadCapacityDeterminism` | 混合负载触顶：拒绝/降级确定且可区分，两遍结论逐位一致 |
 
 ## 主要类型
 

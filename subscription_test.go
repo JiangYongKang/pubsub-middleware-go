@@ -29,7 +29,7 @@ func TestMatchTopic(t *testing.T) {
 // RejectNewest：积压达到容量后新消息失败，原因可区分，且消息不入队、顺序不乱。
 func TestOverflowRejectNewest(t *testing.T) {
 	s := newSubscription("s1", "c1", "t", 3, OverflowRejectNewest)
-	s.attach(&recordingConn{})
+	s.attach(&recordingConn{}, &recordingLane{})
 	var rejected []string
 	for i := 0; i < 5; i++ {
 		o := s.enqueue(msgID(i), "t", nil)
@@ -61,7 +61,7 @@ func TestOverflowRejectNewest(t *testing.T) {
 // DropOldest：积压达到容量后丢弃最旧未发送消息，新消息入队，降级原因可区分。
 func TestOverflowDropOldest(t *testing.T) {
 	s := newSubscription("s1", "c1", "t", 3, OverflowDropOldest)
-	s.attach(&recordingConn{})
+	s.attach(&recordingConn{}, &recordingLane{})
 	var degraded []string
 	for i := 0; i < 5; i++ {
 		o := s.enqueue(msgID(i), "t", nil)
@@ -99,7 +99,7 @@ func TestOfflineInflightReturnedInOrder(t *testing.T) {
 		}
 	}
 	fakeConn := &recordingConn{}
-	s.attach(fakeConn)
+	s.attach(fakeConn, &recordingLane{})
 	first, _ := takeNext(s)
 	second, _ := takeNext(s)
 	if first.messageID != msgID(0) || second.messageID != msgID(1) {
@@ -114,7 +114,7 @@ func TestOfflineInflightReturnedInOrder(t *testing.T) {
 		t.Fatal("must not deliver while offline")
 	}
 	newConn := &recordingConn{}
-	s.attach(newConn)
+	s.attach(newConn, &recordingLane{})
 	var order []string
 	for {
 		m, attempt := takeNext(s)
@@ -138,7 +138,7 @@ func TestOfflineInflightReturnedInOrder(t *testing.T) {
 // ACK 幂等：重复/未知确认不产生错误状态。
 func TestAckIdempotent(t *testing.T) {
 	s := newSubscription("s1", "c1", "t", 3, OverflowRejectNewest)
-	s.attach(&recordingConn{})
+	s.attach(&recordingConn{}, &recordingLane{})
 	o := s.enqueue("m", "t", nil)
 	if o.State != DeliveryStateQueued {
 		t.Fatal(o.Reason)
@@ -169,3 +169,13 @@ func (r *recordingConn) Recv() ([]byte, error) { return nil, nil }
 func (r *recordingConn) Close() error          { r.closed = true; return nil }
 func (r *recordingConn) Done() <-chan struct{} { return nil }
 func (r *recordingConn) ClientID() string      { return "recording" }
+func (r *recordingConn) OpenLane(string) (Lane, error) {
+	return &recordingLane{}, nil
+}
+
+// recordingLane 是单测中的内存数据通道：投递恒成功（背压策略由 enqueue 用例单独验证）。
+type recordingLane struct{}
+
+func (recordingLane) Name() string        { return "recording" }
+func (recordingLane) Send([]byte) error   { return nil }
+func (recordingLane) Recv() ([]byte, error) { return nil, nil }

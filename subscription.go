@@ -38,6 +38,7 @@ type subscription struct {
 	mu       sync.Mutex
 	online   bool
 	attached Conn // 当前附着的连接；只有它能令本订阅离线
+	lane     Lane // 当前附着连接上本订阅独占的数据通道（断连后随连接失效）
 	nextSeq  uint64
 	queue    []*queuedMessage // 待发送（含断连期间从在途归还的消息），按 seq 升序
 	inflight map[uint64]*queuedMessage
@@ -193,6 +194,7 @@ func (s *subscription) goOffline(conn Conn) bool {
 	}
 	s.online = false
 	s.attached = nil
+	s.lane = nil
 	if len(s.inflight) > 0 {
 		returned := make([]*queuedMessage, 0, len(s.inflight))
 		for _, m := range s.inflight {
@@ -210,10 +212,11 @@ func (s *subscription) goOffline(conn Conn) bool {
 	return true
 }
 
-// attach 绑定连接并标记上线，然后唤醒投递循环触发（补）投递。
-func (s *subscription) attach(conn Conn) {
+// attach 绑定连接与其上本订阅独占的数据通道并标记上线，然后唤醒投递循环触发（补）投递。
+func (s *subscription) attach(conn Conn, lane Lane) {
 	s.mu.Lock()
 	s.attached = conn
+	s.lane = lane
 	s.online = true
 	s.mu.Unlock()
 	s.signal()
@@ -222,6 +225,13 @@ func (s *subscription) attach(conn Conn) {
 // notifyCh 返回固定的唤醒通道：入队、attach、在途归还、关闭都会非阻塞发信号。
 // 投递循环采用"被唤醒 -> 取空队列 -> 再等待"模式，无忙循环、无唤醒丢失。
 func (s *subscription) notifyCh() <-chan struct{} { return s.notify }
+
+// currentLane 返回当前附着连接上本订阅独占的数据通道（离线/无通道时为 nil）。
+func (s *subscription) currentLane() Lane {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lane
+}
 
 // markClosed 关闭订阅并唤醒等待者。
 func (s *subscription) markClosed() {

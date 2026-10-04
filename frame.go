@@ -123,12 +123,22 @@ func readU16String(data []byte, pos int) (string, int, bool) {
 
 // Encode 按当前协议版本序列化一帧（空字段省略为零长度）。
 func (f Frame) Encode() ([]byte, error) {
+	return f.EncodeForVersion(FrameCurrentVersion)
+}
+
+// EncodeForVersion 按指定协议版本序列化一帧，用于灰度混排与历史数据自检：
+//   - FrameV1：早期形态——固定头 + 固定长度前缀字段 + payload + checksum，
+//     没有 outcomes/extensions 区。当前版本解码器必须能原样读回。
+//   - FrameCurrentVersion：当前形态（含投递结果区与 TLV 扩展区）。
+//
+// 协议字段"只增不改"：旧形态是新形态在所有追加区为空时的严格前缀。
+func (f Frame) EncodeForVersion(version uint8) ([]byte, error) {
+	if version != FrameV1 && version != FrameCurrentVersion {
+		return nil, &Error{Op: "frame.encode", Reason: ReasonUnsupportedVersion,
+			Err: fmt.Errorf("cannot encode version %d", version)}
+	}
 	b := make([]byte, 0, frameHeaderL+128)
 	b = append(b, frameMagic0, frameMagic1)
-	version := f.Version
-	if version == 0 {
-		version = FrameCurrentVersion
-	}
 	b = append(b, version, byte(f.Type), f.Flags)
 	var a [2]byte
 	binary.BigEndian.PutUint16(a[:], f.Attempt)
@@ -143,6 +153,16 @@ func (f Frame) Encode() ([]byte, error) {
 	binary.BigEndian.PutUint32(l4[:], uint32(len(f.Payload)))
 	b = append(b, l4[:]...)
 	b = append(b, f.Payload...)
+
+	if version == FrameV1 {
+		// 早期形态：payload 后直接以 checksum 结尾，不含 outcomes/extensions。
+		// 即使帧上带了扩展，也不写入 V1——V1 本来就不认识这些字段；
+		// 需要自检新字段请使用当前版本编码。
+		sum := crc32.Checksum(b, crcTable)
+		binary.BigEndian.PutUint32(l4[:], sum)
+		b = append(b, l4[:]...)
+		return b, nil
+	}
 
 	binary.BigEndian.PutUint16(a[:], uint16(len(f.Outcomes)))
 	b = append(b, a[:]...)

@@ -209,8 +209,15 @@ func (b *Broker) handleSubscribe(conn Conn, clientID string, f *Frame, attached 
 	s.mu.Lock()
 	s.filter = f.Filter
 	s.mu.Unlock()
-	// 绑定到当前连接：先附着再唤醒投递循环，确保补投走新连接。
-	s.attach(conn)
+	// 在当前连接上为该订阅打开独占数据通道：投递走数据通道，
+	// 与发布回执等控制帧及其他订阅的投递互不阻塞。
+	lane, err := conn.OpenLane(s.id)
+	if err != nil {
+		b.log("client=%s subscription=%s open lane failed: %v", clientID, s.id, err)
+		return
+	}
+	// 绑定到当前连接：先附着再唤醒投递循环，确保补投走新连接与新数据通道。
+	s.attach(conn, lane)
 	*attached = append(*attached, s)
 	if !created {
 		b.log("client=%s subscription=%s RESUMED filter=%q backlog=%d", clientID, s.id, f.Filter, s.backlog())
@@ -275,16 +282,6 @@ func (b *Broker) dropConn(clientID string, conn Conn) {
 	}
 }
 
-func (b *Broker) currentConn(s *subscription) Conn {
-	b.mu.Lock()
-	ref := b.conns[s.clientID]
-	b.mu.Unlock()
-	if ref == nil {
-		return nil
-	}
-	return ref.load()
-}
-
 // deliverLoop 每个订阅一个 goroutine：仅在在线且有积压时取队首投递，
 // 绝不阻塞发布路径。两种发送失败分开处理：
 //   - 对端接收缓冲满（慢消费者）：消息归还队首，稍后重试，不丢不乱序；
@@ -323,8 +320,8 @@ func (b *Broker) deliverLoop(s *subscription) {
 		}
 		clearRetry()
 		for {
-			conn := b.currentConn(s)
-			if conn == nil {
+			lane := s.currentLane()
+			if lane == nil {
 				break // 已离线，等待重连 attach 的唤醒
 			}
 			msg := s.head()
@@ -343,16 +340,17 @@ func (b *Broker) deliverLoop(s *subscription) {
 				Attempt:        nextAttempt,
 			}
 			df.PutSeq(msg.seq)
-			// 先尝试非阻塞发送：只有真正写进对端连接，才把消息移出队列转入在途。
+			// 仅投递到本订阅独占的数据通道：只有真正写进对端，才把消息移出队列
+			// 转入在途。该通道满只说明这一个订阅消费慢，不触碰控制通道与其他订阅。
 			raw, err := df.Encode()
 			if err != nil {
 				b.log("subscription=%s encode failed seq=%d: %v", s.id, msg.seq, err)
 				break
 			}
-			if err := conn.Send(raw); err != nil {
+			if err := lane.Send(raw); err != nil {
 				if isPeerBufferFull(err) {
 					// 慢消费者：消息仍在队列里（未转在途、未丢失、顺序不变），稍后重试。
-					b.log("subscription=%s PEER-BUFFER-FULL seq=%d msg=%s (publisher unaffected, backlog=%d, retry)",
+					b.log("subscription=%s PEER-BUFFER-FULL seq=%d msg=%s (publisher & control lane unaffected, backlog=%d, retry)",
 						s.id, msg.seq, msg.messageID, s.backlog())
 					scheduleRetry()
 					break

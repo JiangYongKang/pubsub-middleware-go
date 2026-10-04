@@ -139,6 +139,8 @@ func (c *Client) Connect(ctx context.Context) error {
 	go c.runSessionLoop(ctx, conn)
 	go c.runSendLoop(ctx)
 	go c.runDispatchLoop(ctx)
+	// 先在连接上为既有订阅建立独占数据通道与投递泵，再由会话循环完成首次订阅。
+	c.attachAllLanes(ctx, conn)
 	return nil
 }
 
@@ -217,6 +219,8 @@ func (c *Client) runSessionLoop(ctx context.Context, conn Conn) {
 				c.pumpConn(ctx, conn)
 				close(pumpDone)
 			}()
+			// 在新连接上为每个订阅重建独占数据通道与投递泵，再重放订阅帧。
+			c.attachAllLanes(ctx, conn)
 			c.resendAllSubs(conn)
 		case reg := <-c.subReqCh:
 			c.mu.Lock()
@@ -228,9 +232,10 @@ func (c *Client) runSessionLoop(ctx context.Context, conn Conn) {
 			notify := c.subAcks[reg.durableID]
 			c.mu.Unlock()
 			if !exists {
-				// 每个持久订阅一个独立处理 goroutine（首次订阅时建立一次，
-				// 重连只重发订阅帧，不会再建）。
-				c.startSubWorker(reg)
+				// 新订阅：先在当前连接上建立独占数据通道与投递泵（每个订阅一个
+				// 处理 worker，首次订阅建立一次，重连只重建数据通道与泵），
+				// 再发订阅帧，确保第一条投递就走隔离的数据通道。
+				c.attachOneLane(ctx, conn, reg)
 			}
 			f := Frame{Type: FrameSubscribe, SubscriptionID: reg.durableID, Filter: reg.filter}
 			if err := c.writeOn(conn, &f); err != nil {
@@ -266,6 +271,104 @@ func (c *Client) resendAllSubs(conn Conn) {
 	}
 }
 
+// attachAllLanes 在给定（可能是重连后的新）连接上，为每个已登记订阅打开独占
+// 数据通道并启动独立投递泵。每个订阅的投递泵各自阻塞在自己的 lane 与自己的
+// 本地投递通道上：某订阅消费慢只会卡住它自己的泵，把背压沿它自己的数据通道
+// 传回代理；默认控制通道（发布回执、订阅确认、ACK）与其他订阅完全不受影响。
+func (c *Client) attachAllLanes(ctx context.Context, conn Conn) {
+	c.mu.Lock()
+	subs := append([]subReg(nil), c.subs...)
+	c.mu.Unlock()
+	for _, s := range subs {
+		c.attachOneLane(ctx, conn, s)
+	}
+}
+
+// attachOneLane 打开一个订阅的数据通道（若本地投递通道尚未建立则建立并启动
+// 该订阅唯一的串行处理 worker），并启动从该 lane 读取投递帧的 goroutine；
+// lane 与泵随连接结束而退出、重连后重建；处理 worker 终身只建一次。
+func (c *Client) attachOneLane(ctx context.Context, conn Conn, reg subReg) {
+	c.mu.Lock()
+	ch, ok := c.deliverCh[reg.durableID]
+	if !ok {
+		ch = make(chan *Frame, c.deliverSize)
+		c.deliverCh[reg.durableID] = ch
+	}
+	c.mu.Unlock()
+	if !ok {
+		c.startSubWorker(reg) // 首次订阅：建立唯一的串行处理 worker
+	}
+	lane, err := conn.OpenLane(reg.durableID)
+	if err != nil {
+		c.log("open data lane failed durable=%s: %v", reg.durableID, err)
+		return
+	}
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.runLanePump(ctx, conn, lane, ch)
+	}()
+}
+
+// runLanePump 持续读取某订阅独占数据通道上的投递帧，解码后放入该订阅本地
+// 投递通道（由独立的 worker 串行处理）。消费慢只会让本泵阻塞，背压沿 lane
+// 传回代理；不触碰控制通道与任何其他订阅。
+func (c *Client) runLanePump(ctx context.Context, conn Conn, lane Lane, deliverCh chan *Frame) {
+	for {
+		raw, err := lane.Recv()
+		if err != nil {
+			return // 连接断开：随本次会话结束，重连后会重建数据通道与本泵
+		}
+		dr, derr := Decode(raw)
+		if derr != nil {
+			c.log("REJECT frame on data lane=%s decision=%s reason=%s err=%v",
+				lane.Name(), dr.Decision, dr.Reason, derr)
+			_ = conn.Close()
+			return
+		}
+		f := dr.Frame
+		if dr.Reason == ReasonUnknownFieldIgnored {
+			c.log("data lane=%s type=%d PROCESS with ignored future fields tags=%v",
+				lane.Name(), f.Type, dr.IgnoredFields)
+		}
+		if f.Type != FrameDeliver {
+			c.log("data lane=%s unexpected frame type=%d, ignore", lane.Name(), f.Type)
+			continue
+		}
+		select {
+		case deliverCh <- &f:
+		case <-ctx.Done():
+			return
+		case <-c.closeCh:
+			return
+		}
+	}
+}
+
+// startSubWorker 为一个持久订阅启动唯一的串行处理 goroutine：
+// 串行处理本订阅消息（保证同订阅顺序），与其他订阅完全隔离。
+// 本地投递通道由 attachOneLane 预先建立。
+func (c *Client) startSubWorker(reg subReg) {
+	c.mu.Lock()
+	ch := c.deliverCh[reg.durableID]
+	c.mu.Unlock()
+	if ch == nil {
+		return // 防御：attachOneLane 已先建通道
+	}
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		for {
+			select {
+			case <-c.closeCh:
+				return
+			case f := <-ch:
+				c.processOneDelivery(f, reg.handler)
+			}
+		}
+	}()
+}
+
 func (c *Client) pumpConn(ctx context.Context, conn Conn) {
 	stop := make(chan struct{})
 	defer close(stop)
@@ -297,12 +400,13 @@ func (c *Client) pumpConn(ctx context.Context, conn Conn) {
 		}
 		f := dr.Frame
 		if dr.Reason == ReasonUnknownFieldIgnored {
-			c.log("frame type=%d PROCESS with ignored future fields tags=%v", f.Type, dr.IgnoredFields)
+			c.log("control frame type=%d PROCESS with ignored future fields tags=%v", f.Type, dr.IgnoredFields)
 		}
-		// 投递帧直接进入该订阅的独占通道：慢消费者会在此处自然形成背压，
-		// 但只影响它自己；控制帧走独立 controlCh，不被投递阻塞。
+		// 投递帧全部经由各订阅独占数据通道到达；默认通道上若出现投递帧，
+		// 说明对端异常，记录后忽略（不影响控制流）。
 		if f.Type == FrameDeliver {
-			c.routeDeliver(&f)
+			c.log("unexpected DELIVER on control channel sub=%s msg=%s, ignore",
+				f.SubscriptionID, f.MessageID)
 			continue
 		}
 		select {
@@ -383,45 +487,6 @@ func (c *Client) runDispatchLoop(ctx context.Context) {
 			}
 		}
 	}
-}
-
-// routeDeliver 把投递放入订阅独占通道。慢消费者会阻塞在这里，从而把背压
-// 沿传输传导回代理（代理非阻塞发送失败后保留消息重试）；它只阻塞本连接的
-// 接收泵，不影响其他客户端，也不影响本客户端 PublishAck 所在的控制通道。
-func (c *Client) routeDeliver(f *Frame) {
-	c.mu.Lock()
-	ch := c.deliverCh[f.SubscriptionID]
-	c.mu.Unlock()
-	if ch == nil {
-		c.log("DELIVER sub=%s msg=%s no local subscription, skip", f.SubscriptionID, f.MessageID)
-		return
-	}
-	select {
-	case ch <- f:
-	case <-c.closeCh:
-	}
-}
-
-// startSubWorker 为一个持久订阅启动独立处理 goroutine：
-// 串行处理本订阅消息（保证同订阅顺序），与其他订阅完全隔离。
-func (c *Client) startSubWorker(reg subReg) {
-	ch := make(chan *Frame, c.deliverSize)
-	c.mu.Lock()
-	c.deliverCh[reg.durableID] = ch
-	c.mu.Unlock()
-
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		for {
-			select {
-			case <-c.closeCh:
-				return
-			case f := <-ch:
-				c.processOneDelivery(f, reg.handler)
-			}
-		}
-	}()
 }
 
 // processOneDelivery 处理单条投递：先消费端去重，再调用 Handler，成功后自动 ACK。
